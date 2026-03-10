@@ -1,0 +1,22 @@
+{
+  "name": "wa-type-database",
+  "version": "1.0.0",
+  "description": "WhatsApp Web Message Payload Extractor.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "whatsapp",
+    "baileys",
+    "playwright",
+    "xmpp",
+    "protobuf"
+  ],
+  "author": "jsfernandes",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "playwright": "^1.58.2"
+  }
+}
