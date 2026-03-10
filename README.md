@@ -17,8 +17,10 @@ Each time a unique message type or configuration is detected, it is automaticall
 - **XMPP Stanza Interception:** Retrieves the complete surrounding XMPP node structure (`<biz>`, `<enc>`, etc.) alongside its attributes before it gets parsed out by the application.
 - **Protobuf Payload Extraction:** Captures the decrypted JSON payload representing the internal WhatsApp state for a specific message.
 - **Bi-directional Capture:** Intercepts both outgoing (Sent) and incoming (Received) traffic.
+- **Zero-Overhead Architecture:** Utilizes strictly synchronous Javascript interceptors and lightweight `console.log` IPC to prevent blocking the WhatsApp Web pipeline, completely eliminating browser freezes.
+- **Undetectable Execution:** Operates with Playwright's automation flags disabled to avoid triggering WhatsApp's anti-bot protections.
 - **Automatic Cataloging:** Sorts and saves payloads as distinct JSON files into a `/data` folder based on message type and variant identifiers.
-- **Resilient Execution:** Wraps all hooks with robust try/catch blocks ensuring that unrecognized tags or parsing errors do not break the native WhatsApp Web processing loop.
+- **Resilient Execution:** Wraps all hooks with robust try/catch blocks protecting against lazy-getter evaluation exceptions.
 
 ## Installation
 
