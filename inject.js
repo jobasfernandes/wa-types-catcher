@@ -9,8 +9,8 @@
   if (window.__WA_DB_INJECT) return;
   window.__WA_DB_INJECT = true;
 
-  let lastSentStanza = null;
   let lastRecvStanza = null;
+  let pendingSentEntry = null;
 
   const PROTOCOL_KEYS = new Set([
     "serverHello", "ratchetKey", "preKeyId", "baseKey",
@@ -19,6 +19,18 @@
     "signedPreKey", "preKey", "senderKey",
     "encResultMessage", "preKeyWhisperMessage",
     "whiskeyTransport", "hsm"
+  ]);
+
+  const DECODE_BUFFER_TAGS = new Set([
+    "reporting_token", "reporting_tag", "tc", "token",
+    "privacy_token", "tctoken", "hash"
+  ]);
+
+  const TRACKED_ERROR_CODES = new Set(["421", "463", "475", "479"]);
+
+  const TRACKED_IQ_XMLNS = new Set([
+    "privacy", "mex", "abt", "w:biz", "urn:xmpp:whatsapp:dirty",
+    "w:profile:picture", "w:props"
   ]);
 
   function isBufferLike(node) {
@@ -30,6 +42,28 @@
     return false;
   }
 
+  function bufferToHex(buf) {
+    try {
+      const bytes = buf instanceof ArrayBuffer ? new Uint8Array(buf) : buf;
+      if (!bytes || !bytes.length) return "";
+      return Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
+    } catch (e) {
+      return "<hex-error>";
+    }
+  }
+
+  function bufferToBase64(buf) {
+    try {
+      const bytes = buf instanceof ArrayBuffer ? new Uint8Array(buf) : buf;
+      if (!bytes || !bytes.length) return "";
+      let binary = "";
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      return btoa(binary);
+    } catch (e) {
+      return "<b64-error>";
+    }
+  }
+
   function parseBinaryNode(node, depth = 0) {
     if (depth > 15) return "<Max Depth Exceeded>";
     if (!node || typeof node !== "object") return null;
@@ -38,7 +72,9 @@
     }
 
     const result = {};
-    if (node.tag) result._tag = node.tag;
+    const tag = node.tag;
+    if (tag) result._tag = tag;
+    const shouldDecodeBuffer = tag && DECODE_BUFFER_TAGS.has(tag);
 
     if (node.attrs && typeof node.attrs === "object") {
       const cleanAttrs = {};
@@ -59,12 +95,151 @@
         .map((c) => parseBinaryNode(c, depth + 1))
         .filter(Boolean);
     } else if (isBufferLike(node.content)) {
-      result._content = `<Buffer ${node.content.byteLength !== undefined ? node.content.byteLength : node.content.length}b>`;
+      if (shouldDecodeBuffer) {
+        const len = node.content.byteLength !== undefined ? node.content.byteLength : node.content.length;
+        result._content_hex = bufferToHex(node.content);
+        result._content_b64 = bufferToBase64(node.content);
+        result._content_len = len;
+      } else {
+        result._content = `<Buffer ${node.content.byteLength !== undefined ? node.content.byteLength : node.content.length}b>`;
+      }
     } else if (node.content !== null && node.content !== undefined) {
       result._content = node.content;
     }
 
     return result;
+  }
+
+  function extractProtocolMeta(rawNode) {
+    const meta = {};
+    if (!rawNode || !Array.isArray(rawNode.content)) return meta;
+
+    for (const child of rawNode.content) {
+      if (!child || !child.tag) continue;
+
+      if (child.tag === "reporting" && Array.isArray(child.content)) {
+        for (const rc of child.content) {
+          if (rc && rc.tag === "reporting_token" && isBufferLike(rc.content)) {
+            meta.reportingToken = {
+              version: rc.attrs?.v ? String(rc.attrs.v) : undefined,
+              hex: bufferToHex(rc.content),
+              b64: bufferToBase64(rc.content),
+              len: rc.content.byteLength || rc.content.length
+            };
+          }
+          if (rc && rc.tag === "reporting_tag" && isBufferLike(rc.content)) {
+            meta.reportingTag = {
+              hex: bufferToHex(rc.content),
+              b64: bufferToBase64(rc.content),
+              len: rc.content.byteLength || rc.content.length
+            };
+          }
+        }
+      }
+
+      if (child.tag === "tc" || child.tag === "tctoken") {
+        meta.tcToken = parseBinaryNode(child);
+        if (isBufferLike(child.content)) {
+          meta.tcToken._content_hex = bufferToHex(child.content);
+        }
+      }
+
+      if (child.tag === "privacy") {
+        meta.privacyNode = parseBinaryNode(child);
+      }
+
+      if (child.tag === "bot") {
+        meta.botMeta = parseBinaryNode(child);
+      }
+
+      if (child.tag === "meta") {
+        meta.metaNode = parseBinaryNode(child);
+      }
+    }
+
+    return meta;
+  }
+
+  function classifySystemStanza(rawNode) {
+    if (!rawNode || !rawNode.tag) return null;
+    const tag = rawNode.tag;
+    const attrs = rawNode.attrs || {};
+    const attrsStr = {};
+    for (const [k, v] of Object.entries(attrs)) {
+      if (v === undefined || v === null) continue;
+      if (v && typeof v === "object" && v.$1) {
+        const j = v.$1;
+        attrsStr[k] = j.server ? `${j.user}@${j.server}` : `${j.user}@lid`;
+      } else {
+        attrsStr[k] = String(v);
+      }
+    }
+
+    if (tag === "failure" || tag === "stream:error") {
+      const code = attrsStr.reason || attrsStr.code || "unknown";
+      return { type: "ERROR", variant: `${tag}_${code}` };
+    }
+
+    if (tag === "iq") {
+      const xmlns = attrsStr.xmlns || "";
+      const type = attrsStr.type || "";
+
+      let childXmlns = xmlns;
+      if (!childXmlns && Array.isArray(rawNode.content)) {
+        for (const child of rawNode.content) {
+          if (child && child.attrs && child.attrs.xmlns) {
+            childXmlns = String(child.attrs.xmlns);
+            break;
+          }
+        }
+      }
+
+      if (childXmlns === "privacy" || xmlns === "privacy") {
+        return { type: "TC_TOKEN", variant: `iq_${type}` };
+      }
+
+      if (childXmlns === "mex" || xmlns === "mex") {
+        return { type: "LIMIT", variant: `mex_${type}` };
+      }
+
+      if (childXmlns === "abt" || xmlns === "abt" || childXmlns === "w:props" || xmlns === "w:props") {
+        return { type: "AB_PROP", variant: `props_${type}` };
+      }
+
+      if (Array.isArray(rawNode.content)) {
+        for (const child of rawNode.content) {
+          if (child && child.tag === "error") {
+            const errCode = child.attrs?.code ? String(child.attrs.code) : "unknown";
+            if (TRACKED_ERROR_CODES.has(errCode)) {
+              return { type: "ERROR", variant: `iq_error_${errCode}` };
+            }
+          }
+        }
+      }
+
+      if (TRACKED_IQ_XMLNS.has(childXmlns) || TRACKED_IQ_XMLNS.has(xmlns)) {
+        return { type: "IQ_SYSTEM", variant: `${childXmlns || xmlns}_${type}` };
+      }
+
+      return null;
+    }
+
+    if (tag === "notification") {
+      const type = attrsStr.type || "unknown";
+      if (type === "privacy_token" || type === "encrypt" || type === "account_sync") {
+        return { type: "NOTIFICATION", variant: type };
+      }
+      if (Array.isArray(rawNode.content)) {
+        for (const child of rawNode.content) {
+          if (child && (child.tag === "tc" || child.tag === "privacy" || child.tag === "add" || child.tag === "token")) {
+            return { type: "NOTIFICATION", variant: `${type}_${child.tag}` };
+          }
+        }
+      }
+      return null;
+    }
+
+    return null;
   }
 
   function deepCloneSafe(node, depth = 0, seen = new WeakSet()) {
@@ -131,8 +306,17 @@
 
   const DB_PREFIX = "__WA_DB__";
 
+  function detectChatType(stanzaInfo, direction) {
+    if (!stanzaInfo || !stanzaInfo._attrs) return "UNKNOWN";
+    const jid = direction === "SENT" ? stanzaInfo._attrs.to : stanzaInfo._attrs.from;
+    if (!jid) return "UNKNOWN";
+    if (jid.endsWith("@g.us")) return "GRUPO";
+    return "PRIVADO";
+  }
+
   function emitEntry(obj) {
     try {
+      obj.chatType = detectChatType(obj.stanzaInfo, obj.direction);
       console.log(DB_PREFIX + JSON.stringify(deepCloneSafe(obj)));
     } catch (e) {}
   }
@@ -169,8 +353,24 @@
       const t = decoded.protocolMessage.type;
       if (t === 0 || t === "REVOKE")
         return { type: "DELETE", variant: "revoke", payload: decoded };
-      if (t === 14 || t === "MESSAGE_EDIT")
+      if (t === 14 || t === "MESSAGE_EDIT") {
+        const edited = decoded.protocolMessage.editedMessage;
+        if (edited?.richResponseMessage) {
+          const subs = edited.richResponseMessage.submessages || [];
+          const hasTable = subs.some(s =>
+            s.messageType === 4 || s.messageType === "AI_RICH_RESPONSE_TABLE" || s.tableMetadata
+          );
+          const hasCode = subs.some(s =>
+            s.messageType === 5 || s.messageType === "AI_RICH_RESPONSE_CODE" || s.codeMetadata
+          );
+          let variant = "text";
+          if (hasTable && hasCode) variant = "tableAndCode";
+          else if (hasTable) variant = "table";
+          else if (hasCode) variant = "code";
+          return { type: "META_AI", variant, payload: decoded };
+        }
         return { type: "EDIT", variant: "edit", payload: decoded };
+      }
       return null;
     }
 
@@ -270,6 +470,8 @@
       return { type: "INTERACTIVE", variant: "response", payload: decoded };
     if (decoded.productMessage)
       return { type: "INTERACTIVE", variant: "product", payload: decoded };
+    if (decoded.botInvokeMessage)
+      return { type: "BOT_INVOKE", variant: "invoke", payload: decoded };
 
     const unknownKey = Object.keys(decoded).filter(
       (k) => k !== "messageContextInfo" && k !== "$$unknownFieldCount",
@@ -287,6 +489,34 @@
     return { type: "UNKNOWN", variant: unknownKey, payload: decoded };
   }
 
+  function classifyReceipt(stanzaInfo) {
+    if (!stanzaInfo || !stanzaInfo._attrs) return null;
+    const attrs = stanzaInfo._attrs;
+    const receiptType = attrs.type || "delivery";
+
+    const variants = {
+      "read": "read",
+      "read-self": "readSelf",
+      "played": "played",
+      "played-self": "playedSelf",
+      "delivery": "delivery",
+      "inactive": "inactive",
+      "server": "server"
+    };
+
+    return {
+      type: "ACK",
+      variant: variants[receiptType] || receiptType,
+      payload: {
+        messageId: attrs.id,
+        from: attrs.from,
+        to: attrs.to,
+        participant: attrs.participant,
+        timestamp: attrs.t
+      }
+    };
+  }
+
   if (!window._dbinj_decodeStanza)
     window._dbinj_decodeStanza = require("WAWap").decodeStanza;
   require("WAWap").decodeStanza = async (e, t) => {
@@ -296,6 +526,44 @@
         const stanzaJSON = parseBinaryNode(result);
         if (stanzaJSON) {
           lastRecvStanza = stanzaJSON;
+          const protoMeta = extractProtocolMeta(result);
+          if (protoMeta && Object.keys(protoMeta).length) {
+            lastRecvStanza._protocolMeta = protoMeta;
+          }
+        }
+      }
+
+      if (result && (result.tag === "receipt" || result.tag === "ack")) {
+        const stanzaJSON = parseBinaryNode(result);
+        if (stanzaJSON) {
+          const info = classifyReceipt(stanzaJSON);
+          if (info) {
+            emitEntry({
+              direction: "RECV",
+              timestamp: new Date().toISOString(),
+              type: info.type,
+              variant: info.variant,
+              payload: info.payload,
+              stanzaInfo: stanzaJSON
+            });
+          }
+        }
+      }
+
+      if (result) {
+        const sysInfo = classifySystemStanza(result);
+        if (sysInfo) {
+          const stanzaJSON = parseBinaryNode(result);
+          const protoMeta = extractProtocolMeta(result);
+          emitEntry({
+            direction: "RECV",
+            timestamp: new Date().toISOString(),
+            type: sysInfo.type,
+            variant: sysInfo.variant,
+            payload: stanzaJSON,
+            protocolMeta: Object.keys(protoMeta).length ? protoMeta : undefined,
+            stanzaInfo: stanzaJSON
+          });
         }
       }
     } catch (err) {}
@@ -308,8 +576,48 @@
     try {
       if (stanza && stanza.tag === "message") {
         const stanzaJSON = parseBinaryNode(stanza);
+        if (stanzaJSON && pendingSentEntry) {
+          const protoMeta = extractProtocolMeta(stanza);
+          if (protoMeta && Object.keys(protoMeta).length) {
+            pendingSentEntry.protocolMeta = protoMeta;
+          }
+          pendingSentEntry.stanzaInfo = stanzaJSON;
+          emitEntry(pendingSentEntry);
+          pendingSentEntry = null;
+        }
+      }
+
+      if (stanza && (stanza.tag === "receipt" || stanza.tag === "ack")) {
+        const stanzaJSON = parseBinaryNode(stanza);
         if (stanzaJSON) {
-          lastSentStanza = stanzaJSON;
+          const info = classifyReceipt(stanzaJSON);
+          if (info) {
+            emitEntry({
+              direction: "SENT",
+              timestamp: new Date().toISOString(),
+              type: info.type,
+              variant: info.variant,
+              payload: info.payload,
+              stanzaInfo: stanzaJSON
+            });
+          }
+        }
+      }
+
+      if (stanza) {
+        const sysInfo = classifySystemStanza(stanza);
+        if (sysInfo) {
+          const stanzaJSON = parseBinaryNode(stanza);
+          const protoMeta = extractProtocolMeta(stanza);
+          emitEntry({
+            direction: "SENT",
+            timestamp: new Date().toISOString(),
+            type: sysInfo.type,
+            variant: sysInfo.variant,
+            payload: stanzaJSON,
+            protocolMeta: Object.keys(protoMeta).length ? protoMeta : undefined,
+            stanzaInfo: stanzaJSON
+          });
         }
       }
     } catch (err) {}
@@ -325,14 +633,14 @@
       if (info) {
         const innerPayload =
           a.deviceSentMessage?.message || a.ephemeralMessage?.message || a;
-        emitEntry({
+        pendingSentEntry = {
           direction: "SENT",
           timestamp: new Date().toISOString(),
           type: info.type,
           variant: info.variant,
           payload: innerPayload,
-          stanzaInfo: lastSentStanza,
-        });
+          stanzaInfo: null,
+        };
       }
     } catch (e) {}
     return result;
@@ -367,5 +675,5 @@
     return result;
   };
 
-  console.log("✅ WA DB Injector operational! Intercepting Stanza + Payload.");
+  console.log("✅ WA DB Injector operational! Intercepting Stanza + Payload + tctoken/reporting/limits.");
 })();
