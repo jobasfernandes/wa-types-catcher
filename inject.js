@@ -23,7 +23,8 @@
 
   const DECODE_BUFFER_TAGS = new Set([
     "reporting_token", "reporting_tag", "tc", "token",
-    "privacy_token", "tctoken", "hash"
+    "privacy_token", "tctoken", "hash",
+    "query", "result", "data", "variables", "error", "digest"
   ]);
 
   const TRACKED_ERROR_CODES = new Set(["421", "463", "475", "479"]);
@@ -64,6 +65,27 @@
     }
   }
 
+  function tryDecodeBufferText(buf) {
+    try {
+      const bytes = buf instanceof ArrayBuffer ? new Uint8Array(buf) : buf;
+      if (!bytes || !bytes.length) return { text: null, json: null };
+      const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+      let printable = 0;
+      for (let i = 0; i < text.length; i++) {
+        const c = text.charCodeAt(i);
+        if ((c >= 32 && c < 127) || c === 9 || c === 10 || c === 13) printable++;
+      }
+      if (text.length === 0 || printable / text.length < 0.7) {
+        return { text: null, json: null };
+      }
+      let json = null;
+      try { json = JSON.parse(text); } catch (e) {}
+      return { text, json };
+    } catch (e) {
+      return { text: null, json: null };
+    }
+  }
+
   function parseBinaryNode(node, depth = 0) {
     if (depth > 15) return "<Max Depth Exceeded>";
     if (!node || typeof node !== "object") return null;
@@ -100,6 +122,9 @@
         result._content_hex = bufferToHex(node.content);
         result._content_b64 = bufferToBase64(node.content);
         result._content_len = len;
+        const decoded = tryDecodeBufferText(node.content);
+        if (decoded.text !== null) result._content_text = decoded.text;
+        if (decoded.json !== null) result._content_json = decoded.json;
       } else {
         result._content = `<Buffer ${node.content.byteLength !== undefined ? node.content.byteLength : node.content.length}b>`;
       }
@@ -158,6 +183,35 @@
     }
 
     return meta;
+  }
+
+  function extractMexMeta(rawNode) {
+    if (!rawNode || !Array.isArray(rawNode.content)) return null;
+    const found = [];
+    for (const child of rawNode.content) {
+      if (!child || (child.tag !== "query" && child.tag !== "result")) continue;
+      const entry = { kind: child.tag };
+      const attrs = child.attrs || {};
+      if (attrs.op_name) entry.opName = String(attrs.op_name);
+      if (attrs.query_id) entry.queryId = String(attrs.query_id);
+      if (attrs.hash) entry.hash = String(attrs.hash);
+      if (attrs.type) entry.queryType = String(attrs.type);
+      if (isBufferLike(child.content)) {
+        entry.bodyLen = child.content.byteLength || child.content.length;
+        const decoded = tryDecodeBufferText(child.content);
+        if (decoded.json !== null) entry.bodyJSON = decoded.json;
+        else if (decoded.text !== null) entry.bodyText = decoded.text.slice(0, 8000);
+        else entry.bodyHex = bufferToHex(child.content);
+      } else if (typeof child.content === "string") {
+        try {
+          entry.bodyJSON = JSON.parse(child.content);
+        } catch (e) {
+          entry.bodyText = child.content.slice(0, 8000);
+        }
+      }
+      found.push(entry);
+    }
+    return found.length ? found : null;
   }
 
   function classifySystemStanza(rawNode) {
@@ -555,6 +609,11 @@
         if (sysInfo) {
           const stanzaJSON = parseBinaryNode(result);
           const protoMeta = extractProtocolMeta(result);
+          const mexMeta = sysInfo.type === "LIMIT" ? extractMexMeta(result) : null;
+          if (mexMeta) {
+            const opNames = mexMeta.map(m => m.opName || m.queryId || m.kind).join(",");
+            console.log(`📡 MEX RECV: ${opNames}`);
+          }
           emitEntry({
             direction: "RECV",
             timestamp: new Date().toISOString(),
@@ -562,6 +621,7 @@
             variant: sysInfo.variant,
             payload: stanzaJSON,
             protocolMeta: Object.keys(protoMeta).length ? protoMeta : undefined,
+            mexMeta: mexMeta || undefined,
             stanzaInfo: stanzaJSON
           });
         }
@@ -609,6 +669,11 @@
         if (sysInfo) {
           const stanzaJSON = parseBinaryNode(stanza);
           const protoMeta = extractProtocolMeta(stanza);
+          const mexMeta = sysInfo.type === "LIMIT" ? extractMexMeta(stanza) : null;
+          if (mexMeta) {
+            const opNames = mexMeta.map(m => m.opName || m.queryId || m.kind).join(",");
+            console.log(`📡 MEX SENT: ${opNames}`);
+          }
           emitEntry({
             direction: "SENT",
             timestamp: new Date().toISOString(),
@@ -616,6 +681,7 @@
             variant: sysInfo.variant,
             payload: stanzaJSON,
             protocolMeta: Object.keys(protoMeta).length ? protoMeta : undefined,
+            mexMeta: mexMeta || undefined,
             stanzaInfo: stanzaJSON
           });
         }
