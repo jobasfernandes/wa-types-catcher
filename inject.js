@@ -6,6 +6,7 @@
 (function () {
   "use strict";
 
+  if (window.top !== window.self) return;
   if (window.__WA_DB_INJECT) return;
   window.__WA_DB_INJECT = true;
 
@@ -24,7 +25,27 @@
   const DECODE_BUFFER_TAGS = new Set([
     "reporting_token", "reporting_tag", "tc", "token",
     "privacy_token", "tctoken", "hash",
-    "query", "result", "data", "variables", "error", "digest"
+    "query", "result", "data", "variables", "error", "digest",
+    "ref", "device-identity", "device", "biz", "platform", "key-index",
+    "credential_id", "webauthn_assertion", "prologue_payload",
+    "pairing_handoff_proof", "passkey_request_options",
+    "primary_ephemeral_identity", "companion_nonce", "encrypted_pairing_request",
+    "link_code_pairing_ref", "link_code_pairing_wrapped_companion_ephemeral_pub",
+    "link_code_pairing_wrapped_primary_ephemeral_pub", "wrapped_key_bundle",
+    "companion_identity_public", "companion_server_auth_key_pub",
+    "integrity_challenge", "challenge", "passkey_challenge", "captcha_challenge"
+  ]);
+
+  // Tags de child que identificam stanzas de pareamento (handshake companion).
+  const PAIRING_IQ_TAGS = new Set([
+    "pair-device", "pair-success", "pair-device-sign",
+    "passkey_prologue", "passkey_request_options", "companion_nonce",
+    "encrypted_pairing_request", "ref", "link_code_companion_reg"
+  ]);
+
+  // Types de notification ligados a pareamento / passkey / integridade.
+  const PAIRING_NOTIF_TYPES = new Set([
+    "passkey_prologue_request", "crsc_continuation", "link_code_companion_reg"
   ]);
 
   const TRACKED_ERROR_CODES = new Set(["421", "463", "475", "479"]);
@@ -248,6 +269,17 @@
         }
       }
 
+      if (Array.isArray(rawNode.content)) {
+        for (const child of rawNode.content) {
+          if (child && child.tag && PAIRING_IQ_TAGS.has(child.tag)) {
+            return { type: "PAIRING", variant: `iq_${type}_${child.tag}` };
+          }
+        }
+      }
+      if (childXmlns === "md" || xmlns === "md") {
+        return { type: "PAIRING", variant: `iq_${type}_md` };
+      }
+
       if (childXmlns === "privacy" || xmlns === "privacy") {
         return { type: "TC_TOKEN", variant: `iq_${type}` };
       }
@@ -280,6 +312,19 @@
 
     if (tag === "notification") {
       const type = attrsStr.type || "unknown";
+      if (PAIRING_NOTIF_TYPES.has(type)) {
+        return { type: "PAIRING", variant: `notif_${type}` };
+      }
+      if (type === "mex") {
+        return { type: "INTEGRITY", variant: "mex_notification" };
+      }
+      if (Array.isArray(rawNode.content)) {
+        for (const child of rawNode.content) {
+          if (child && child.tag && /integrity|passkey|checkpoint|challenge/i.test(child.tag)) {
+            return { type: "INTEGRITY", variant: `${type}_${child.tag}` };
+          }
+        }
+      }
       if (type === "privacy_token" || type === "encrypt" || type === "account_sync") {
         return { type: "NOTIFICATION", variant: type };
       }
@@ -571,9 +616,15 @@
     };
   }
 
+  function installStanzaHooks() {
+    if (window.__WA_DB_STANZA_HOOKED) return true;
+    let WAWap;
+    try { WAWap = require("WAWap"); } catch (e) { return false; }
+    if (!WAWap || typeof WAWap.decodeStanza !== "function" || typeof WAWap.encodeStanza !== "function") return false;
+
   if (!window._dbinj_decodeStanza)
-    window._dbinj_decodeStanza = require("WAWap").decodeStanza;
-  require("WAWap").decodeStanza = async (e, t) => {
+    window._dbinj_decodeStanza = WAWap.decodeStanza;
+  WAWap.decodeStanza = async (e, t) => {
     const result = await window._dbinj_decodeStanza(e, t);
     try {
       if (result && result.tag === "message") {
@@ -631,8 +682,8 @@
   };
 
   if (!window._dbinj_encodeStanza)
-    window._dbinj_encodeStanza = require("WAWap").encodeStanza;
-  require("WAWap").encodeStanza = (stanza) => {
+    window._dbinj_encodeStanza = WAWap.encodeStanza;
+  WAWap.encodeStanza = (stanza) => {
     try {
       if (stanza && stanza.tag === "message") {
         const stanzaJSON = parseBinaryNode(stanza);
@@ -690,9 +741,24 @@
     return window._dbinj_encodeStanza(stanza);
   };
 
+    window.__WA_DB_STANZA_HOOKED = true;
+    console.log("✅ WA DB: stanza hooks armed (pairing + integrity + system + receipts)");
+    return true;
+  }
+
+  function installMessageHooks() {
+    if (window.__WA_DB_MSG_HOOKED) return true;
+    let sendApi, decProto;
+    try {
+      sendApi = require("WAWebSendMsgCommonApi");
+      decProto = require("decodeProtobuf");
+    } catch (e) { return false; }
+    if (!sendApi || typeof sendApi.encodeAndPad !== "function") return false;
+    if (!decProto || typeof decProto.decodeProtobuf !== "function") return false;
+
   if (!window._dbinj_encodePad)
-    window._dbinj_encodePad = require("WAWebSendMsgCommonApi").encodeAndPad;
-  require("WAWebSendMsgCommonApi").encodeAndPad = (a) => {
+    window._dbinj_encodePad = sendApi.encodeAndPad;
+  sendApi.encodeAndPad = (a) => {
     const result = window._dbinj_encodePad(a);
     try {
       const info = classify(a);
@@ -713,8 +779,8 @@
   };
 
   if (!window._dbinj_decodeProto)
-    window._dbinj_decodeProto = require("decodeProtobuf").decodeProtobuf;
-  require("decodeProtobuf").decodeProtobuf = (a, b) => {
+    window._dbinj_decodeProto = decProto.decodeProtobuf;
+  decProto.decodeProtobuf = (a, b) => {
     const result = window._dbinj_decodeProto(a, b);
     if (!result || typeof result !== "object") return result;
     const firstKey = Object.keys(result).find(
@@ -741,5 +807,22 @@
     return result;
   };
 
-  console.log("✅ WA DB Injector operational! Intercepting Stanza + Payload + tctoken/reporting/limits.");
+    window.__WA_DB_MSG_HOOKED = true;
+    console.log("✅ WA DB: message payload hooks armed");
+    return true;
+  }
+
+  let stanzaArmed = installStanzaHooks();
+  let msgArmed = installMessageHooks();
+  if (!stanzaArmed || !msgArmed) {
+    let tries = 0;
+    const iv = setInterval(() => {
+      tries++;
+      if (!stanzaArmed) stanzaArmed = installStanzaHooks();
+      if (!msgArmed) msgArmed = installMessageHooks();
+      if ((stanzaArmed && msgArmed) || tries > 1200) clearInterval(iv);
+    }, 250);
+  }
+
+  console.log("✅ WA DB Injector loaded — pairing/integrity capture enabled; waiting for WA core modules.");
 })();

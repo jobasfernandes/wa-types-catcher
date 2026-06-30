@@ -13,7 +13,8 @@ ensureDir(DATA_DIR);
 const DB_PREFIX = "__WA_DB__";
 
 const SYSTEM_TYPES = new Set([
-  "TC_TOKEN", "ERROR", "LIMIT", "AB_PROP", "NOTIFICATION", "IQ_SYSTEM"
+  "TC_TOKEN", "ERROR", "LIMIT", "AB_PROP", "NOTIFICATION", "IQ_SYSTEM",
+  "PAIRING", "INTEGRITY"
 ]);
 
 function processEntry(raw) {
@@ -21,9 +22,10 @@ function processEntry(raw) {
     const entry = typeof raw === "string" ? JSON.parse(raw) : raw;
     if (!entry || !entry.type) return;
 
-    const direction = entry.direction.toUpperCase();
-    const type = entry.type.toUpperCase();
-    const variant = entry.variant || "default";
+    const safe = (s) => String(s).replace(/[^a-zA-Z0-9._-]/g, "-");
+    const direction = safe(entry.direction.toUpperCase());
+    const type = safe(entry.type.toUpperCase());
+    const variant = safe(entry.variant || "default");
     const chatType = entry.chatType || "UNKNOWN";
     const isSystemEvent = SYSTEM_TYPES.has(type);
 
@@ -78,6 +80,8 @@ async function startScraper() {
     ],
   });
 
+  context.on("close", () => process.exit(0));
+
   const page = context.pages()[0] || (await context.newPage());
 
   page.on("console", (msg) => {
@@ -87,25 +91,26 @@ async function startScraper() {
     }
   });
 
-  console.log("Opening WhatsApp Web...");
-  await page.goto("https://web.whatsapp.com");
-
-  console.log("Waiting for interface to load...");
-  await page.waitForSelector("#pane-side", { timeout: 0 });
-
-  console.log("WhatsApp Web loaded successfully!");
-
-  await page.waitForTimeout(2000);
-
   const scriptPath = path.join(__dirname, "inject.js");
   const scriptContent = fs.readFileSync(scriptPath, "utf8");
 
-  console.log("Injecting message type extractor (Stanza + Protobuf + tctoken/limits)...");
-  await page.evaluate(scriptContent);
+  // Injeta ANTES de qualquer script da pagina, em todo documento/reload, para
+  // armar os hooks ja' na tela de pareamento (pair-device/pair-success +
+  // passkey_prologue_request + integrity challenge MEX), nao apenas apos o login.
+  await page.addInitScript(scriptContent);
+
+  console.log("Opening WhatsApp Web (pairing/integrity capture armed)...");
+  await page.goto("https://web.whatsapp.com");
 
   console.log(
-    "Listening for messages + protocol events... (tctoken, reporting, error codes, AB props)",
+    "Capturando handshake de pareamento + eventos de protocolo (pair-device/pair-success, passkey_prologue, integrity MEX, tctoken, erros).",
   );
+  console.log(
+    "Para reproduzir o sintoma: escaneie o QR com a conta afetada. Eventos caem em data/SYSTEM/{PAIRING,INTEGRITY,ERROR,...}.",
+  );
+
+  await page.waitForSelector("#pane-side", { timeout: 0 }).catch(() => {});
+  console.log("Login detectado (ou ainda na tela de pareamento). Captura segue ativa ate' fechar o navegador.");
 }
 
 startScraper().catch(console.error);
