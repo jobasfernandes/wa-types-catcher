@@ -10,6 +10,31 @@
   if (window.__WA_DB_INJECT) return;
   window.__WA_DB_INJECT = true;
 
+  // Configuracao do experimento da flag de IA, injetada por index.js.
+  // injectBot        -> adiciona <bot biz_bot="1"> (default) no <message> de saida
+  // forceAiRendering -> forca o AB prop que libera o selo "IA" no balao
+  // Os dois NUNCA devem ficar ligados na mesma conta: o ramo `fromMe` do label le
+  // o modelo LOCAL, entao remetente com gate forcado mostra "IA" mesmo se o servidor
+  // tiver descartado o <bot>. Ligue injectBot no remetente e forceAiRendering no destinatario.
+  const LAB = Object.assign(
+    {
+      injectBot: false,
+      forceAiRendering: false,
+      botAttrs: { biz_bot: "1" },
+      dumpStanzas: false,
+    },
+    window.__WA_LAB || {}
+  );
+
+  // Default de fabrica e' false: WAWebABPropsConfigs -> [4873, "bool", !1, !1].
+  // Lido por WAWebBotBaseGating.isBizBot1pEnabled(), avaliado a cada render.
+  const AB_OVERRIDES = { wabai_message_rendering_enabled: true };
+
+  const LAB_PREFIX = "__WA_LAB__";
+  function labLog(msg) {
+    try { console.log(LAB_PREFIX + msg); } catch (e) {}
+  }
+
   let lastRecvStanza = null;
   let pendingSentEntry = null;
 
@@ -24,7 +49,7 @@
 
   const DECODE_BUFFER_TAGS = new Set([
     "reporting_token", "reporting_tag", "tc", "token",
-    "privacy_token", "tctoken", "hash",
+    "privacy_token", "tctoken", "cstoken", "hash",
     "query", "result", "data", "variables", "error", "digest",
     "ref", "device-identity", "device", "biz", "platform", "key-index",
     "credential_id", "webauthn_assertion", "prologue_payload",
@@ -33,7 +58,10 @@
     "link_code_pairing_ref", "link_code_pairing_wrapped_companion_ephemeral_pub",
     "link_code_pairing_wrapped_primary_ephemeral_pub", "wrapped_key_bundle",
     "companion_identity_public", "companion_server_auth_key_pub",
-    "integrity_challenge", "challenge", "passkey_challenge", "captcha_challenge"
+    "integrity_challenge", "challenge", "passkey_challenge", "captcha_challenge",
+    "enc", "audio", "video", "video_state", "relay", "te", "te2", "capability",
+    "enc_key", "transport", "net", "endpoint", "relaylatency", "encopt",
+    "offer", "accept", "preaccept", "destination", "participant", "hbh_key"
   ]);
 
   // Tags de child que identificam stanzas de pareamento (handshake companion).
@@ -187,6 +215,13 @@
         meta.tcToken = parseBinaryNode(child);
         if (isBufferLike(child.content)) {
           meta.tcToken._content_hex = bufferToHex(child.content);
+        }
+      }
+
+      if (child.tag === "cstoken") {
+        meta.csToken = parseBinaryNode(child);
+        if (isBufferLike(child.content)) {
+          meta.csToken._content_hex = bufferToHex(child.content);
         }
       }
 
@@ -616,6 +651,88 @@
     };
   }
 
+  function jidToString(v) {
+    if (v == null) return "?";
+    if (typeof v === "object" && v.$1) {
+      const j = v.$1;
+      return j.server ? `${j.user}@${j.server}` : `${j.user}@lid`;
+    }
+    return String(v);
+  }
+
+  // wap() devolve instancia de WapNode e o encoder testa `instanceof` (WAWap.js:159,176),
+  // entao objeto literal nao serve. CUSTOM_STRING e' identidade (WAWap.js:635), pode omitir.
+  // Espelha o que o proprio WhatsApp Web monta em WAWebSendMsgCreateFanoutStanza:1025.
+  function injectBotNode(WAWap, stanza) {
+    if (!LAB.injectBot) return false;
+    if (!stanza || stanza.tag !== "message") return false;
+    if (!Array.isArray(stanza.content)) return false;
+    if (stanza.content.some((c) => c && c.tag === "bot")) return false;
+    // wap() joga se algum valor de attr for null, e o proprio WhatsApp suprime o
+    // no quando nao ha atributo nenhum: nos dois casos nao ha o que injetar.
+    if (!LAB.botAttrs || Object.keys(LAB.botAttrs).length === 0) return false;
+    stanza.content.push(WAWap.wap("bot", LAB.botAttrs));
+    return true;
+  }
+
+  // Sinal objetivo do experimento: qual <bot> chega ao destinatario.
+  // biz_bot="1" e' o que dispara o selo (WAWebHandleMsgParser:711-715 le esse atributo);
+  // o servidor repassa biz_bot verbatim, mas filtra local_automated_type de conta nao autorizada.
+  function logIncomingBot(rawNode) {
+    if (!rawNode || !Array.isArray(rawNode.content)) return;
+    const botChild = rawNode.content.find((c) => c && c.tag === "bot");
+    if (!botChild) return;
+    const parsed = parseBinaryNode(botChild) || {};
+    const attrs = rawNode.attrs || {};
+    labLog(
+      `<bot> RECEBIDO from=${jidToString(attrs.from)} id=${attrs.id} ` +
+      `attrs=${JSON.stringify(parsed._attrs || {})}`
+    );
+  }
+
+  // O fluxo normal de captura dedupa por tipo+variante e correlaciona payload com
+  // `lastRecvStanza`, que e' o ultimo stanza visto e nao necessariamente o dono do payload.
+  // Para investigar estrutura de stanza os dois comportamentos atrapalham: este dump grava
+  // TODO stanza de mensagem, sem dedup e sem depender do pipeline de protobuf.
+  function dumpMessageStanza(direction, node) {
+    if (!LAB.dumpStanzas) return;
+    if (!node || node.tag !== "message") return;
+    const parsed = parseBinaryNode(node);
+    if (!parsed) return;
+    const tags = (parsed._children || []).map((c) => c._tag).filter(Boolean);
+    emitEntry({
+      direction,
+      timestamp: new Date().toISOString(),
+      type: "MSG_STANZA",
+      variant: tags.join("-") || "empty",
+      payload: parsed,
+      stanzaInfo: parsed,
+    });
+    if (direction === "RECV") {
+      const a = node.attrs || {};
+      labLog(`stanza RECV from=${jidToString(a.from)} id=${a.id} filhos=[${tags.join(", ")}]`);
+    }
+  }
+
+  function installAbPropOverride() {
+    if (!LAB.forceAiRendering) return true;
+    if (window.__WA_DB_ABPROP_HOOKED) return true;
+    let ABProps;
+    try { ABProps = require("WAWebABProps"); } catch (e) { return false; }
+    if (!ABProps || typeof ABProps.getABPropConfigValue !== "function") return false;
+
+    if (!window._dbinj_getABProp)
+      window._dbinj_getABProp = ABProps.getABPropConfigValue;
+    ABProps.getABPropConfigValue = (name) =>
+      Object.prototype.hasOwnProperty.call(AB_OVERRIDES, name)
+        ? AB_OVERRIDES[name]
+        : window._dbinj_getABProp(name);
+
+    window.__WA_DB_ABPROP_HOOKED = true;
+    labLog(`AB props forcados: ${Object.keys(AB_OVERRIDES).join(", ")}`);
+    return true;
+  }
+
   function installStanzaHooks() {
     if (window.__WA_DB_STANZA_HOOKED) return true;
     let WAWap;
@@ -636,6 +753,8 @@
             lastRecvStanza._protocolMeta = protoMeta;
           }
         }
+        logIncomingBot(result);
+        dumpMessageStanza("RECV", result);
       }
 
       if (result && (result.tag === "receipt" || result.tag === "ack")) {
@@ -653,6 +772,21 @@
             });
           }
         }
+      }
+
+      if (result && result.tag === "call") {
+        const stanzaJSON = parseBinaryNode(result);
+        const kids = Array.isArray(result.content) ? result.content : [];
+        const verb = kids.length && kids[0] ? kids[0].tag : "unknown";
+        console.log(`📞 CALL RECV verb=${verb}`);
+        emitEntry({
+          direction: "RECV",
+          timestamp: new Date().toISOString(),
+          type: "CALL",
+          variant: verb,
+          payload: stanzaJSON,
+          stanzaInfo: stanzaJSON
+        });
       }
 
       if (result) {
@@ -684,7 +818,20 @@
   if (!window._dbinj_encodeStanza)
     window._dbinj_encodeStanza = WAWap.encodeStanza;
   WAWap.encodeStanza = (stanza) => {
+    // Antes da captura de proposito: o JSON salvo tem que refletir o que foi pro wire.
     try {
+      if (injectBotNode(WAWap, stanza)) {
+        const a = stanza.attrs || {};
+        labLog(
+          `<bot ${JSON.stringify(LAB.botAttrs)}> INJETADO ` +
+          `to=${jidToString(a.to)} id=${a.id}`
+        );
+      }
+    } catch (e) {
+      labLog(`falha ao injetar <bot>: ${e && e.message}`);
+    }
+    try {
+      dumpMessageStanza("SENT", stanza);
       if (stanza && stanza.tag === "message") {
         const stanzaJSON = parseBinaryNode(stanza);
         if (stanzaJSON && pendingSentEntry) {
@@ -692,6 +839,14 @@
           if (protoMeta && Object.keys(protoMeta).length) {
             pendingSentEntry.protocolMeta = protoMeta;
           }
+          try {
+            const to = stanzaJSON._attrs && (stanzaJSON._attrs.to || stanzaJSON._attrs.jid);
+            const hasTc = !!(protoMeta && protoMeta.tcToken);
+            const hasCs = !!(protoMeta && protoMeta.csToken);
+            const state = hasTc ? "tctoken" : hasCs ? "cstoken" : "NONE";
+            pendingSentEntry.sendTokenState = state;
+            console.log(`📤 SEND msg to=${to} token=${state}${state === "NONE" ? "  ⚠️ TOKENLESS (cold send)" : ""}`);
+          } catch (e) {}
           pendingSentEntry.stanzaInfo = stanzaJSON;
           emitEntry(pendingSentEntry);
           pendingSentEntry = null;
@@ -713,6 +868,21 @@
             });
           }
         }
+      }
+
+      if (stanza && stanza.tag === "call") {
+        const stanzaJSON = parseBinaryNode(stanza);
+        const kids = Array.isArray(stanza.content) ? stanza.content : [];
+        const verb = kids.length && kids[0] ? kids[0].tag : "unknown";
+        console.log(`📞 CALL SENT verb=${verb}`);
+        emitEntry({
+          direction: "SENT",
+          timestamp: new Date().toISOString(),
+          type: "CALL",
+          variant: verb,
+          payload: stanzaJSON,
+          stanzaInfo: stanzaJSON
+        });
       }
 
       if (stanza) {
@@ -814,15 +984,22 @@
 
   let stanzaArmed = installStanzaHooks();
   let msgArmed = installMessageHooks();
-  if (!stanzaArmed || !msgArmed) {
+  let abArmed = installAbPropOverride();
+  if (!stanzaArmed || !msgArmed || !abArmed) {
     let tries = 0;
     const iv = setInterval(() => {
       tries++;
       if (!stanzaArmed) stanzaArmed = installStanzaHooks();
       if (!msgArmed) msgArmed = installMessageHooks();
-      if ((stanzaArmed && msgArmed) || tries > 1200) clearInterval(iv);
+      if (!abArmed) abArmed = installAbPropOverride();
+      if ((stanzaArmed && msgArmed && abArmed) || tries > 1200) clearInterval(iv);
     }, 250);
   }
+
+  labLog(
+    `perfil armado: injectBot=${LAB.injectBot} ` +
+    `forceAiRendering=${LAB.forceAiRendering} botAttrs=${JSON.stringify(LAB.botAttrs)}`
+  );
 
   console.log("✅ WA DB Injector loaded — pairing/integrity capture enabled; waiting for WA core modules.");
 })();
